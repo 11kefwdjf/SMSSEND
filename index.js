@@ -44,7 +44,7 @@ async function startBot() {
   try { await bot.deleteWebhook({ drop_pending_updates: true }); } catch (_) {}
   // Dar 6 segundos para que Railway mate el contenedor viejo
   await new Promise(r => setTimeout(r, 6000));
-  await bot.startPolling({ polling: true });
+  await bot.startPolling();
 }
 let browser     = null;
 let page        = null;
@@ -78,7 +78,13 @@ for (const d of [SESSION_DIR, LISTS_DIR]) {
 }
 
 // ── HELPERS ──────────────────────────────────────────────────────────────────
-const isAllowed  = m => m?.from?.username === ALLOWED_USERNAME || m?.username === ALLOWED_USERNAME;
+const isAllowed  = m => {
+  const user = m?.from?.username || m?.username || "";
+  const ok   = !ALLOWED_USERNAME || user.toLowerCase() === ALLOWED_USERNAME.toLowerCase();
+  if (!ok) console.warn(`⛔ Acceso denegado: @${user}`);
+  else     console.log(`✅ Mensaje de @${user}: ${m?.text || m?.data || "(no text)"}`);
+  return ok;
+};
 const sleep      = ms => new Promise(r => setTimeout(r, ms));
 const rand       = (a, b) => a + Math.floor(Math.random() * (b - a));
 const fmtTime    = ms => {
