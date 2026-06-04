@@ -1,36 +1,33 @@
 #!/usr/bin/env node
-// Bot Enviador Google Messages v1.0
-// Envía SMS a través de tu Android vinculado con Google Messages Web
+// Bot Enviador Google Messages v2.0
+// Flujo: /start → pide .txt → pide mensaje → envía con progreso en vivo
 "use strict";
 
 const TelegramBot = require("node-telegram-bot-api");
 const puppeteer   = require("puppeteer");
 const fs          = require("fs");
 const path        = require("path");
+const https       = require("https");
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const TOKEN            = process.env.TELEGRAM_TOKEN || "8710402523:AAHzR-ZQ8XR_qSJSOzJ6VPFIZYD1HnLoJtA";
-const ALLOWED_USERNAME = process.env.ALLOWED_USER   || "K11000K";
-const SESSION_DIR      = "./session_data";   // datos de sesión persistentes
-const LISTS_DIR        = "./listas";         // listas de números .txt
+const ALLOWED_USERNAME = process.env.ALLOWED_USER   || "";  // vacío = sin restricción
+const SESSION_DIR      = "./session_data";
 
 // ── ANTI-BAN ────────────────────────────────────────────────────────────────
-const DELAY_MIN   = 4000;   // ms mínimo entre mensajes
-const DELAY_MAX   = 9000;   // ms máximo entre mensajes
-const BATCH_SIZE  = 15;     // mensajes por lote antes de pausa larga
-const BATCH_PAUSE = 90000;  // pausa entre lotes (ms)
-const NAV_TIMEOUT = 30000;  // timeout de navegación (ms)
-const QR_TIMEOUT  = 120000; // tiempo máximo para escanear QR (ms)
+const DELAY_MIN   = 4000;
+const DELAY_MAX   = 9000;
+const BATCH_SIZE  = 15;
+const BATCH_PAUSE = 90000;
+const NAV_TIMEOUT = 30000;
+const QR_TIMEOUT  = 120000;
 
-// ── ESTADO GLOBAL ────────────────────────────────────────────────────────────
-// Arrancamos SIN polling automático para controlarlo manualmente
+// ── BOT ───────────────────────────────────────────────────────────────────────
 const bot = new TelegramBot(TOKEN, { polling: false });
 
-// En 409 salimos limpiamente — Railway reiniciará el contenedor
-// y para entonces el despliegue anterior ya habrá muerto
 bot.on("polling_error", async err => {
   if (err.message && err.message.includes("409")) {
-    console.warn("⚠️  409 Conflict: saliendo para que Railway reinicie limpio...");
+    console.warn("⚠️ 409 Conflict — reiniciando limpio...");
     await bot.stopPolling().catch(() => {});
     process.exit(0);
   } else {
@@ -38,113 +35,116 @@ bot.on("polling_error", async err => {
   }
 });
 
-// Función de arranque con delay para sobrevivir rolling deploys
 async function startBot() {
-  // Eliminar webhook + descartar mensajes acumulados (limpia sesión anterior)
   try { await bot.deleteWebhook({ drop_pending_updates: true }); } catch (_) {}
-  // Dar 6 segundos para que Railway mate el contenedor viejo
   await new Promise(r => setTimeout(r, 6000));
   await bot.startPolling();
+  console.log("✅ Polling activo. Esperando /start...");
 }
-let browser     = null;
-let page        = null;
-let connected   = false;
-let connecting  = false;
 
-// Cola de envío
+// ── ESTADO DE CONEXIÓN ────────────────────────────────────────────────────────
+let browser    = null;
+let page       = null;
+let connected  = false;
+let connecting = false;
+
+// ── ESTADO POR CHAT ───────────────────────────────────────────────────────────
+// Cada chatId tiene su propio estado de flujo
+// state: "idle" | "wait_file" | "wait_message" | "sending"
+const chatState = new Map();  // chatId → { state, phones, liveMsgId }
+
+// Cola de envío (solo un envío a la vez globalmente)
 const queue = {
-  items: [],    // [{ phone, message }]
-  on: false,
-  stop: false,
-  sent: 0,
-  failed: 0,
-  total: 0,
-  chat: null,
-  start: null,
-  currentMsg: ""
+  running: false,
+  stop:    false,
+  sent:    0,
+  failed:  0,
+  total:   0,
+  items:   [],
+  chat:    null,
+  liveMsgId: null,
+  startTime: null,
 };
 
-// Espera de texto de mensaje
-const waitMsg   = new Map(); // chatId → { phone?, listFile? }
-const waitList  = new Map(); // chatId → pendiente de archivo
-
-// Live message
-let liveMsgId   = null;
-let liveMsgChat = null;
-
-// Dirs
-for (const d of [SESSION_DIR, LISTS_DIR]) {
-  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
-}
-
-// ── HELPERS ──────────────────────────────────────────────────────────────────
-const isAllowed  = m => {
-  const user = m?.from?.username || m?.username || "";
-  const ok   = !ALLOWED_USERNAME || user.toLowerCase() === ALLOWED_USERNAME.toLowerCase();
-  if (!ok) console.warn(`⛔ Acceso denegado: @${user}`);
-  else     console.log(`✅ Mensaje de @${user}: ${m?.text || m?.data || "(no text)"}`);
-  return ok;
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+const isAllowed = m => {
+  if (!ALLOWED_USERNAME) return true;
+  const user = (m?.from?.username || m?.username || "").toLowerCase();
+  return user === ALLOWED_USERNAME.toLowerCase();
 };
-const sleep      = ms => new Promise(r => setTimeout(r, ms));
-const rand       = (a, b) => a + Math.floor(Math.random() * (b - a));
-const fmtTime    = ms => {
+const sleep   = ms => new Promise(r => setTimeout(r, ms));
+const rand    = (a, b) => a + Math.floor(Math.random() * (b - a));
+const fmtTime = ms => {
   if (!ms || ms < 0) return "—";
   const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
-  return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s % 60}s`;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
+};
+const progressBar = (done, total) => {
+  const filled = total > 0 ? Math.round((done / total) * 10) : 0;
+  return "█".repeat(filled) + "░".repeat(10 - filled);
 };
 
-// ── LIVE SEND ────────────────────────────────────────────────────────────────
-async function live(chat, txt, ex = {}) {
-  const rm = ex?.reply_markup;
-  if (liveMsgId && liveMsgChat === chat) {
-    const ok = await bot.editMessageText(txt, {
-      chat_id: chat, message_id: liveMsgId,
-      parse_mode: "Markdown", reply_markup: rm || undefined
+// ── EDITAR / ENVIAR MENSAJE EN VIVO ──────────────────────────────────────────
+async function editOrSend(chatId, msgId, text, extra = {}) {
+  if (msgId) {
+    const ok = await bot.editMessageText(text, {
+      chat_id: chatId, message_id: msgId,
+      parse_mode: "Markdown", ...extra
     }).catch(() => null);
-    if (ok) return ok;
+    if (ok) return msgId;
   }
-  const m = await bot.sendMessage(chat, txt, { parse_mode: "Markdown", ...ex }).catch(() => null);
-  if (m) { liveMsgId = m.message_id; liveMsgChat = chat; }
-  return m;
+  const m = await bot.sendMessage(chatId, text, { parse_mode: "Markdown", ...extra }).catch(() => null);
+  return m ? m.message_id : null;
 }
 
-// ── TECLADOS ─────────────────────────────────────────────────────────────────
-const kb = {
-  main: () => {
-    const rows = [];
-    if (!connected) {
-      rows.push([{ text: "📱 Conectar Android", callback_data: "connect" }]);
-    } else {
-      rows.push([{ text: "📱 Android vinculado ✅", callback_data: "conn_info" }]);
-    }
-    rows.push([{ text: "✉️ Enviar a un número",   callback_data: "send_single" }]);
-    rows.push([{ text: "📋 Enviar a una lista",    callback_data: "send_list"   }]);
-    rows.push([{ text: "📊 Estado de envío",       callback_data: "queue_status"}]);
-    rows.push([{ text: "🗂️ Mis listas",            callback_data: "my_lists"   }]);
-    if (connected) rows.push([{ text: "🔌 Desconectar", callback_data: "disconnect" }]);
-    return { reply_markup: { inline_keyboard: rows } };
-  },
-  cancel:  () => ({ inline_keyboard: [[{ text: "❌ Cancelar", callback_data: "cancel_connect" }]] }),
-  running: () => ({ reply_markup: { inline_keyboard: [[
-    { text: "📊 Estado",   callback_data: "queue_status" },
-    { text: "⛔ Detener", callback_data: "stop_send"     }
-  ]] }}),
-  done: () => ({ reply_markup: { inline_keyboard: [
-    [{ text: "✉️ Nuevo envío", callback_data: "send_single" }],
-    [{ text: "📋 Enviar lista", callback_data: "send_list"   }],
-    [{ text: "🏠 Menú",         callback_data: "main"         }],
-  ]}}),
-};
+// ── PARSEAR TELÉFONOS DE .TXT ─────────────────────────────────────────────────
+function parsePhones(content) {
+  const phones = [];
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const match = trimmed.match(/[\+]?(\d[\d\s\-]{5,})/);
+    if (match) phones.push(match[1].replace(/[\s\-]/g, ""));
+  }
+  return [...new Set(phones)]; // sin duplicados
+}
+
+// ── DESCARGAR ARCHIVO DE TELEGRAM ─────────────────────────────────────────────
+async function downloadFile(fileId) {
+  const fileInfo = await bot.getFile(fileId);
+  const url = `https://api.telegram.org/file/bot${TOKEN}/${fileInfo.file_path}`;
+  return new Promise((resolve, reject) => {
+    https.get(url, res => {
+      let data = "";
+      res.on("data", chunk => data += chunk);
+      res.on("end", () => resolve(data));
+      res.on("error", reject);
+    }).on("error", reject);
+  });
+}
 
 // ── CONEXIÓN GOOGLE MESSAGES ──────────────────────────────────────────────────
-async function connectGM(chat) {
-  if (connecting) { await live(chat, "⏳ *Conexión en curso, espera...*"); return; }
-  if (connected)  { await live(chat, "✅ *Ya está conectado*", kb.main()); return; }
+async function ensureConnected(chatId) {
+  if (connected) return true;
+  if (connecting) {
+    await bot.sendMessage(chatId, "⏳ *Conexión en curso, espera...*", { parse_mode: "Markdown" });
+    return false;
+  }
+  return await connectGM(chatId);
+}
 
+async function connectGM(chatId) {
+  if (connecting) return false;
   connecting = true;
-  await live(chat, "🔄 *Iniciando Google Messages Web...*\n_Puede tardar hasta 20 segundos_");
+
+  const waitMsg = await bot.sendMessage(chatId,
+    "🔄 *Iniciando Google Messages Web...*\n_Puede tardar hasta 20 segundos_",
+    { parse_mode: "Markdown" }
+  ).catch(() => null);
 
   try {
+    if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
+
     browser = await puppeteer.launch({
       headless: "new",
       args: [
@@ -157,11 +157,9 @@ async function connectGM(chat) {
 
     const pages = await browser.pages();
     page = pages[0] || await browser.newPage();
-
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-      "AppleWebKit/537.36 (KHTML, like Gecko) " +
-      "Chrome/124.0.0.0 Safari/537.36"
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     );
     await page.setViewport({ width: 1280, height: 800 });
 
@@ -170,55 +168,47 @@ async function connectGM(chat) {
     });
 
     // ¿Sesión ya activa?
-    const url = page.url();
-    if (url.includes("/conversations")) {
+    if (page.url().includes("/conversations")) {
       connected  = true;
       connecting = false;
-      await live(chat, "✅ *Sesión restaurada automáticamente*\n🟢 Google Messages listo", kb.main());
-      return;
+      if (waitMsg) bot.deleteMessage(chatId, waitMsg.message_id).catch(() => {});
+      await bot.sendMessage(chatId, "✅ *Sesión restaurada automáticamente*", { parse_mode: "Markdown" });
+      return true;
     }
 
-    await live(chat, "📷 *Generando código QR...*\n_Espera un momento_");
+    // Esperar QR
+    if (waitMsg) {
+      await bot.editMessageText("📷 *Generando código QR...*", {
+        chat_id: chatId, message_id: waitMsg.message_id, parse_mode: "Markdown"
+      }).catch(() => {});
+    }
 
-    // Esperar canvas del QR
     await page.waitForSelector("canvas", { timeout: 20000 }).catch(() => {});
-
     const qrDataUrl = await page.evaluate(() => {
       const canvas = document.querySelector("canvas");
-      return canvas ? canvas.toDataURL("image/png") : null;
-    });
-
-    if (!qrDataUrl) {
-      // Intentar con img
-      const imgSrc = await page.evaluate(() => {
-        const img = document.querySelector("img[src^='data:image']");
-        return img ? img.src : null;
-      });
-      if (!imgSrc) throw new Error("No se encontró el código QR en la página");
-    }
-
-    const src = qrDataUrl || await page.evaluate(() => {
+      if (canvas) return canvas.toDataURL("image/png");
       const img = document.querySelector("img[src^='data:image']");
       return img ? img.src : null;
     });
 
-    const base64 = src.replace(/^data:image\/\w+;base64,/, "");
+    if (!qrDataUrl) throw new Error("No se encontró el código QR en la página");
+
+    const base64 = qrDataUrl.replace(/^data:image\/\w+;base64,/, "");
     const qrBuf  = Buffer.from(base64, "base64");
 
-    liveMsgId = null; liveMsgChat = null;
-    const qrMsg = await bot.sendPhoto(chat, qrBuf, {
+    if (waitMsg) bot.deleteMessage(chatId, waitMsg.message_id).catch(() => {});
+
+    const qrMsg = await bot.sendPhoto(chatId, qrBuf, {
       caption:
-        "📱 *Escanea este código QR con tu Android*\n\n" +
+        "📱 *Escanea este QR con tu Android*\n\n" +
         "1️⃣ Abre *Google Messages* en tu teléfono\n" +
         "2️⃣ Toca ⋮ → *Dispositivos vinculados*\n" +
         "3️⃣ Toca *Vincular nuevo dispositivo*\n" +
         "4️⃣ Escanea el código\n\n" +
-        "⏳ _Tienes 2 minutos para escanear_",
-      parse_mode:   "Markdown",
-      reply_markup: kb.cancel()
+        "⏳ _Tienes 2 minutos. Después del QR el envío empezará automáticamente._",
+      parse_mode: "Markdown",
     }).catch(() => null);
 
-    // Esperar que el usuario escanee y la URL cambie a /conversations
     await page.waitForFunction(
       () => window.location.href.includes("/conversations"),
       { timeout: QR_TIMEOUT }
@@ -226,57 +216,30 @@ async function connectGM(chat) {
 
     connected  = true;
     connecting = false;
-
-    if (qrMsg) bot.deleteMessage(chat, qrMsg.message_id).catch(() => {});
-    liveMsgId = null; liveMsgChat = null;
-    await live(chat,
-      "✅ *¡Android vinculado correctamente!*\n" +
-      "🟢 Google Messages listo para enviar SMS\n\n" +
-      "Usa *Enviar a un número* o *Enviar a una lista*.",
-      kb.main()
-    );
+    if (qrMsg) bot.deleteMessage(chatId, qrMsg.message_id).catch(() => {});
+    await bot.sendMessage(chatId, "✅ *¡Android vinculado! Iniciando envío...*", { parse_mode: "Markdown" });
+    return true;
 
   } catch (e) {
     connecting = false;
-    if (browser) {
-      try { await browser.close(); } catch (_) {}
-      browser = null; page = null;
-    }
-    await live(chat,
-      `❌ *Error al conectar*\n\`${e.message.slice(0, 150)}\`\n\nPulsa 📱 *Conectar Android* para reintentar.`,
-      kb.main()
+    if (browser) { try { await browser.close(); } catch (_) {} browser = null; page = null; }
+    await bot.sendMessage(chatId,
+      `❌ *Error al conectar:* \`${e.message.slice(0, 150)}\`\n\nUsa /start para reintentar.`,
+      { parse_mode: "Markdown" }
     );
+    return false;
   }
-}
-
-// ── DESCONECTAR ───────────────────────────────────────────────────────────────
-async function disconnectGM(chat) {
-  if (queue.on) { await live(chat, "⚠️ *Detén el envío primero*", kb.running()); return; }
-  connected  = false;
-  connecting = false;
-  if (browser) {
-    try { await browser.close(); } catch (_) {}
-    browser = null; page = null;
-  }
-  // Borrar sesión guardada para desvincularse completamente
-  try { fs.rmSync(SESSION_DIR, { recursive: true, force: true }); fs.mkdirSync(SESSION_DIR); } catch (_) {}
-  await live(chat, "🔴 *Dispositivo desvinculado*\nPulsa 📱 *Conectar Android* para volver a vincular.", kb.main());
 }
 
 // ── ENVIAR UN SMS ─────────────────────────────────────────────────────────────
 async function sendOneSMS(phone, message) {
   if (!connected || !page) throw new Error("No hay dispositivo conectado");
-
-  // Normalizar número (sin espacios, con + si no lo tiene)
   const num = phone.trim().replace(/\s+/g, "");
 
-  // Abrir nueva conversación directamente por URL
-  await page.goto(
-    `https://messages.google.com/web/conversations/new`,
-    { waitUntil: "networkidle2", timeout: NAV_TIMEOUT }
-  );
+  await page.goto("https://messages.google.com/web/conversations/new", {
+    waitUntil: "networkidle2", timeout: NAV_TIMEOUT
+  });
 
-  // Buscar campo de número
   const inputSel = [
     'input[type="tel"]',
     'mw-contact-chips-input input',
@@ -290,7 +253,6 @@ async function sendOneSMS(phone, message) {
   await page.keyboard.press("Enter");
   await sleep(1500);
 
-  // Esperar campo de mensaje
   const textSel = [
     'div[contenteditable="true"][aria-label]',
     'textarea.message-input',
@@ -299,40 +261,65 @@ async function sendOneSMS(phone, message) {
 
   await page.waitForSelector(textSel, { timeout: 12000 });
   await page.click(textSel);
-  // Escribir mensaje parte a parte para evitar bloqueos
   for (const chunk of message.match(/.{1,50}/g) || [message]) {
     await page.type(textSel, chunk, { delay: 30 });
   }
-
   await sleep(600);
 
-  // Enviar con Enter (o botón de envío)
   const sendBtn = await page.$('button[aria-label="Enviar mensaje"], button[aria-label="Send message"]');
-  if (sendBtn) {
-    await sendBtn.click();
-  } else {
-    await page.keyboard.press("Enter");
-  }
+  if (sendBtn) await sendBtn.click();
+  else         await page.keyboard.press("Enter");
 
   await sleep(1000);
   return true;
 }
 
-// ── PROCESAR COLA ─────────────────────────────────────────────────────────────
+// ── TECLADO DETENER ───────────────────────────────────────────────────────────
+const stopKeyboard = () => ({
+  reply_markup: {
+    inline_keyboard: [[{ text: "⛔ Detener envío", callback_data: "stop_send" }]]
+  }
+});
+const doneKeyboard = () => ({
+  reply_markup: {
+    inline_keyboard: [[{ text: "🔄 Nuevo envío", callback_data: "new_send" }]]
+  }
+});
+
+// ── COLA DE ENVÍO ─────────────────────────────────────────────────────────────
 async function runQueue() {
-  queue.on   = true;
-  queue.stop = false;
-  queue.sent = queue.failed = 0;
-  queue.start = Date.now();
+  queue.running   = true;
+  queue.stop      = false;
+  queue.sent      = 0;
+  queue.failed    = 0;
+  queue.startTime = Date.now();
+  const chatId    = queue.chat;
+  const total     = queue.items.length;
 
-  await live(queue.chat,
-    `📤 *Envío iniciado*\n` +
-    `📊 Total: *${queue.total}* mensajes\n` +
-    `⚡ Delay: ${DELAY_MIN/1000}–${DELAY_MAX/1000}s entre mensajes`,
-    kb.running()
-  );
+  // Mensaje inicial en vivo
+  const buildText = (extra = "") => {
+    const done    = queue.sent + queue.failed;
+    const pct     = total > 0 ? ((done / total) * 100).toFixed(1) : "0.0";
+    const bar     = progressBar(done, total);
+    const elapsed = Date.now() - queue.startTime;
+    return (
+      `📤 *Enviando mensajes...*\n\n` +
+      `\`[${bar}]\` ${pct}%\n\n` +
+      `✅ Enviados:   *${queue.sent}*\n` +
+      `❌ Fallidos:   *${queue.failed}*\n` +
+      `📋 Pendientes: *${total - done}*\n` +
+      `📊 Total:      *${total}*\n` +
+      `⏱️ Tiempo:     *${fmtTime(elapsed)}*` +
+      (extra ? `\n\n${extra}` : "")
+    );
+  };
 
-  const total = queue.items.length;
+  // Enviar mensaje de progreso inicial
+  const initMsg = await bot.sendMessage(chatId, buildText(), {
+    parse_mode: "Markdown",
+    ...stopKeyboard()
+  }).catch(() => null);
+  queue.liveMsgId = initMsg ? initMsg.message_id : null;
 
   for (let i = 0; i < queue.items.length; ) {
     if (queue.stop) break;
@@ -341,44 +328,29 @@ async function runQueue() {
     try {
       await sendOneSMS(item.phone, item.message);
       queue.sent++;
-      i++;
     } catch (e) {
       queue.failed++;
-      i++;
-      // Reconectar si la página está caída
       if (!connected) {
-        await live(queue.chat, "⚠️ *Conexión perdida, reintentando...*", kb.running());
+        queue.liveMsgId = await editOrSend(chatId, queue.liveMsgId,
+          buildText("⚠️ _Conexión perdida, reintentando..._"), stopKeyboard()
+        );
         await sleep(5000);
         if (!connected) break;
       }
     }
+    i++;
 
-    const elapsed = Date.now() - queue.start;
-    const done    = queue.sent + queue.failed;
-    const pct     = total > 0 ? ((done / total) * 100).toFixed(1) : "0";
-    const bar     = "█".repeat(Math.round(done / total * 10)) + "░".repeat(10 - Math.round(done / total * 10));
-
-    await live(queue.chat,
-      `📤 *Enviando mensajes...*\n` +
-      `[${bar}] ${done}/${total}\n` +
-      `✅ Enviados: ${queue.sent.toLocaleString()}\n` +
-      `❌ Fallidos: ${queue.failed.toLocaleString()}\n` +
-      `📋 Pendientes: ${total - done}\n` +
-      `📈 Progreso: ${pct}%\n` +
-      `⏱️ Tiempo: ${fmtTime(elapsed)}`,
-      kb.running()
+    // Actualizar mensaje de progreso
+    queue.liveMsgId = await editOrSend(chatId, queue.liveMsgId,
+      buildText(), stopKeyboard()
     );
 
     if (i < queue.items.length && !queue.stop) {
-      // Pausa larga cada BATCH_SIZE mensajes
+      // Pausa larga anti-ban cada BATCH_SIZE
       if (queue.sent > 0 && queue.sent % BATCH_SIZE === 0) {
-        await live(queue.chat,
-          `🛡️ *Pausa anti-ban* (lote ${Math.floor(queue.sent / BATCH_SIZE)})\n` +
-          `💤 Reanudando en ${fmtTime(BATCH_PAUSE)}...\n` +
-          `✅ Enviados hasta ahora: ${queue.sent}`,
-          kb.running()
+        queue.liveMsgId = await editOrSend(chatId, queue.liveMsgId,
+          buildText(`🛡️ _Pausa anti-ban ${fmtTime(BATCH_PAUSE)}..._`), stopKeyboard()
         );
-        // Espera interrumpible
         const steps = Math.ceil(BATCH_PAUSE / 3000);
         for (let s = 0; s < steps; s++) {
           if (queue.stop) break;
@@ -390,301 +362,249 @@ async function runQueue() {
     }
   }
 
-  queue.on = false;
-  const elapsed = Date.now() - queue.start;
-  queue.items   = [];
-
-  await live(queue.chat,
-    (queue.stop ? "⛔ *Envío detenido*\n" : "✅ *Envío completado*\n") +
-    `✉️ Enviados: ${queue.sent.toLocaleString()}\n` +
-    `❌ Fallidos: ${queue.failed.toLocaleString()}\n` +
-    `⏱️ Duración: ${fmtTime(elapsed)}`,
-    kb.done()
-  );
-}
-
-// ── ESTADO ────────────────────────────────────────────────────────────────────
-async function sendStatus(chat) {
-  if (!queue.on) {
-    await live(chat, "ℹ️ *No hay envíos en progreso*", kb.main());
-    return;
-  }
-  const elapsed = Date.now() - queue.start;
+  queue.running = false;
+  const elapsed = Date.now() - queue.startTime;
   const done    = queue.sent + queue.failed;
-  const pct     = queue.total > 0 ? ((done / queue.total) * 100).toFixed(1) : "0";
-  const bar     = "█".repeat(Math.round(done / queue.total * 10)) + "░".repeat(10 - Math.round(done / queue.total * 10));
-  await live(chat,
-    `📊 *Estado de envío*\n` +
-    `[${bar}] ${done}/${queue.total}\n` +
-    `✅ Enviados: ${queue.sent.toLocaleString()}\n` +
-    `❌ Fallidos: ${queue.failed.toLocaleString()}\n` +
-    `📋 Pendientes: ${queue.total - done}\n` +
-    `📈 Progreso: ${pct}%\n` +
-    `⏱️ Tiempo: ${fmtTime(elapsed)}`,
-    kb.running()
+  const pct     = total > 0 ? ((done / total) * 100).toFixed(1) : "0.0";
+  const bar     = progressBar(done, total);
+  const finalTxt = (
+    (queue.stop ? "⛔ *Envío detenido*" : "✅ *Envío completado*") + `\n\n` +
+    `\`[${bar}]\` ${pct}%\n\n` +
+    `✅ Enviados:   *${queue.sent}*\n` +
+    `❌ Fallidos:   *${queue.failed}*\n` +
+    `📊 Total:      *${total}*\n` +
+    `⏱️ Duración:   *${fmtTime(elapsed)}*`
   );
+
+  await editOrSend(chatId, queue.liveMsgId, finalTxt, doneKeyboard());
+  queue.liveMsgId = null;
+  queue.items     = [];
+
+  // Resetear estado del chat
+  const st = chatState.get(chatId) || {};
+  st.state = "idle";
+  chatState.set(chatId, st);
 }
 
-// ── MIS LISTAS ────────────────────────────────────────────────────────────────
-async function sendMyLists(chat) {
-  const files = fs.readdirSync(LISTS_DIR).filter(f => f.endsWith(".txt"));
-  if (!files.length) { await live(chat, "📂 *No hay listas guardadas*", kb.main()); return; }
+// ── INICIAR PROCESO DE ENVÍO ──────────────────────────────────────────────────
+async function startSending(chatId) {
+  const st = chatState.get(chatId);
+  if (!st || !st.phones || !st.message) return;
 
-  let txt = "📂 *Listas disponibles*\n";
-  for (const f of files) {
-    let count = 0;
-    try { count = fs.readFileSync(path.join(LISTS_DIR, f), "utf-8").split("\n").filter(l => l.trim()).length; } catch (_) {}
-    txt += `📄 *${f.replace(".txt", "")}* — ${count.toLocaleString()} números\n`;
+  // Conectar si no está conectado
+  const ok = await ensureConnected(chatId);
+  if (!ok) {
+    // el usuario necesita escanear QR; después de conectar, proceder
+    // Guardaremos un flag para reanudar tras la conexión
+    st.pendingSend = true;
+    chatState.set(chatId, st);
+    return;
   }
 
-  const buttons = files.map(f => [{
-    text: `📤 Usar: ${f.replace(".txt", "")}`,
-    callback_data: `use_list_${f.replace(".txt", "").slice(0, 35)}`
-  }]);
-  buttons.push([{ text: "🏠 Menú", callback_data: "main" }]);
-  await live(chat, txt, { reply_markup: { inline_keyboard: buttons } });
-}
-
-// ── CARGAR NÚMEROS DE ARCHIVO ─────────────────────────────────────────────────
-function loadPhones(filePath) {
-  const content = fs.readFileSync(filePath, "utf-8");
-  const phones  = [];
-  for (const line of content.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    // Soporta: "+34600123456", "34600123456", "600123456", "600123456 | Nombre"
-    const match = trimmed.match(/^[\+]?(\d[\d\s\-]{6,})/);
-    if (match) phones.push(match[1].replace(/[\s\-]/g, ""));
-  }
-  return phones;
-}
-
-// ── CALLBACKS ────────────────────────────────────────────────────────────────
-bot.on("callback_query", async q => {
-  const chat = q.message.chat.id;
-  const d    = q.data;
-  bot.answerCallbackQuery(q.id).catch(() => {});
-
-  if (!isAllowed(q)) { await live(chat, "🚫 *Acceso denegado*"); return; }
-
-  if (d === "main") {
-    liveMsgId = null; liveMsgChat = null;
-    await live(chat,
-      `🤖 *Google Messages Sender v1.0*\n` +
-      `📱 ${connected ? "🟢 Android vinculado" : "🔴 Sin dispositivo"}\n` +
-      `📤 ${queue.on ? `Enviando... ${queue.sent}/${queue.total}` : "En reposo"}`,
-      kb.main()
+  if (queue.running) {
+    await bot.sendMessage(chatId,
+      "⚠️ *Ya hay un envío en curso.*\nEspera a que termine o pulsa Detener.",
+      { parse_mode: "Markdown" }
     );
     return;
   }
 
-  if (d === "connect") {
-    if (queue.on) { await live(chat, "⚠️ *Detén el envío primero*", kb.running()); return; }
-    connectGM(chat).catch(e => { connecting = false; live(chat, `❌ \`${e.message}\``, kb.main()); });
-    return;
-  }
+  queue.items = st.phones.map(p => ({ phone: p, message: st.message }));
+  queue.total = st.phones.length;
+  queue.chat  = chatId;
+  st.state    = "sending";
+  chatState.set(chatId, st);
 
-  if (d === "cancel_connect") {
-    connecting = false;
-    if (browser) { try { await browser.close(); } catch (_) {} browser = null; page = null; }
-    await live(chat, "❌ *Conexión cancelada*", kb.main());
-    return;
-  }
-
-  if (d === "conn_info") {
-    await live(chat,
-      `✅ *Android conectado*\n` +
-      `🌐 Google Messages Web activo\n` +
-      `📤 Listo para enviar SMS`,
-      kb.main()
+  runQueue().catch(async e => {
+    queue.running = false;
+    await bot.sendMessage(chatId,
+      `💥 *Error crítico:* \`${e.message.slice(0, 200)}\`\n\nUsa /start para reintentar.`,
+      { parse_mode: "Markdown" }
     );
-    return;
-  }
+    const s = chatState.get(chatId) || {};
+    s.state = "idle";
+    chatState.set(chatId, s);
+  });
+}
 
-  if (d === "disconnect") {
-    await disconnectGM(chat);
-    return;
-  }
-
-  if (d === "send_single") {
-    if (!connected) { await live(chat, "❌ *Sin dispositivo conectado*\nPulsa 📱 *Conectar Android* primero.", kb.main()); return; }
-    if (queue.on)   { await live(chat, "⚠️ *Envío en curso*", kb.running()); return; }
-    waitMsg.set(chat, { step: "phone" });
-    await live(chat, "📱 *Escribe el número de teléfono destinatario*\n_Ejemplo: +34600123456 o 600123456_\n\nEscribe /cancelar para cancelar.");
-    return;
-  }
-
-  if (d === "send_list") {
-    if (!connected) { await live(chat, "❌ *Sin dispositivo conectado*\nPulsa 📱 *Conectar Android* primero.", kb.main()); return; }
-    if (queue.on)   { await live(chat, "⚠️ *Envío en curso*", kb.running()); return; }
-    await sendMyLists(chat);
-    return;
-  }
-
-  if (d.startsWith("use_list_")) {
-    const name     = d.slice(9);
-    const filePath = path.join(LISTS_DIR, `${name}.txt`);
-    if (!fs.existsSync(filePath)) { await live(chat, "❌ *Lista no encontrada*", kb.main()); return; }
-    waitMsg.set(chat, { step: "message", listFile: filePath });
-    const count = loadPhones(filePath).length;
-    await live(chat,
-      `📋 *Lista seleccionada:* ${name}\n` +
-      `📊 ${count.toLocaleString()} números\n\n` +
-      `✉️ *Escribe el mensaje que quieres enviar:*\n` +
-      `_Puedes usar emojis y saltos de línea_\n\n` +
-      `Escribe /cancelar para cancelar.`
-    );
-    return;
-  }
-
-  if (d === "queue_status") { await sendStatus(chat); return; }
-
-  if (d === "stop_send") {
-    if (!queue.on) { await live(chat, "ℹ️ *No hay envíos en curso*", kb.main()); return; }
-    queue.stop = true;
-    await live(chat, "⛔ *Deteniendo envío...*");
-    return;
-  }
-
-  if (d === "my_lists") {
-    await sendMyLists(chat);
-    return;
-  }
-});
-
-// ── MENSAJES DE TEXTO ─────────────────────────────────────────────────────────
+// ── MENSAJES ──────────────────────────────────────────────────────────────────
 bot.on("message", async m => {
-  const chat = m.chat.id;
-  if (!isAllowed(m)) { await live(chat, "🚫 *Acceso denegado*"); return; }
+  if (!m) return;
+  const chatId = m.chat.id;
 
-  // Comandos
-  if (m.text === "/cancelar") {
-    waitMsg.delete(chat);
-    waitList.delete(chat);
-    liveMsgId = null; liveMsgChat = null;
-    await live(chat,
-      `🤖 *Google Messages Sender v1.0*\n` +
-      `📱 ${connected ? "🟢 Android vinculado" : "🔴 Sin dispositivo"}`,
-      kb.main()
+  // Control de acceso
+  if (!isAllowed(m)) {
+    await bot.sendMessage(chatId, "🚫 *Acceso denegado*", { parse_mode: "Markdown" });
+    return;
+  }
+
+  // /start
+  if (m.text === "/start") {
+    const st = chatState.get(chatId) || {};
+    if (queue.running && queue.chat === chatId) {
+      await bot.sendMessage(chatId, "⚠️ *Hay un envío en curso.*\nUsa el botón ⛔ Detener para pararlo.", { parse_mode: "Markdown" });
+      return;
+    }
+    st.state = "wait_file";
+    st.phones = null;
+    st.message = null;
+    chatState.set(chatId, st);
+    await bot.sendMessage(chatId,
+      "👋 *¡Hola! Bot Enviador Google Messages v2.0*\n\n" +
+      "📎 *Paso 1/2:* Envíame el archivo *.txt* con los números de teléfono\n" +
+      "_Un número por línea. Ejemplo:_\n" +
+      "```\n+34600123456\n+34611223344\n600987654\n```",
+      { parse_mode: "Markdown" }
     );
     return;
   }
 
-  if (m.text === "/estado")   { await sendStatus(chat); return; }
-  if (m.text === "/parar")    { if (queue.on) { queue.stop = true; live(chat, "⛔ *Deteniendo...*"); } return; }
-  if (m.text === "/listas")   { await sendMyLists(chat); return; }
-  if (m.text === "/conectar") {
-    if (queue.on) { await live(chat, "⚠️ *Detén el envío primero*", kb.running()); return; }
-    connectGM(chat).catch(e => { connecting = false; live(chat, `❌ \`${e.message}\``, kb.main()); });
+  // /parar
+  if (m.text === "/parar" || m.text === "/stop") {
+    if (queue.running) {
+      queue.stop = true;
+      await bot.sendMessage(chatId, "⛔ *Deteniendo envío...*", { parse_mode: "Markdown" });
+    } else {
+      await bot.sendMessage(chatId, "ℹ️ No hay ningún envío en curso.", { parse_mode: "Markdown" });
+    }
     return;
   }
 
-  // Flujo de envío a número único
-  if (waitMsg.has(chat)) {
-    const state = waitMsg.get(chat);
+  const st = chatState.get(chatId) || { state: "idle" };
 
-    if (state.step === "phone") {
-      const phone = (m.text || "").trim();
-      if (!phone.match(/[\d]{6,}/)) {
-        await live(chat, "❌ *Número no válido*\nEscribe el número de teléfono (mínimo 6 dígitos):");
-        return;
-      }
-      state.phone = phone;
-      state.step  = "message";
-      waitMsg.set(chat, state);
-      await live(chat,
-        `✅ *Número:* \`${phone}\`\n\n` +
-        `✉️ *Ahora escribe el mensaje a enviar:*\n\n` +
-        `Escribe /cancelar para cancelar.`
+  // ── Esperando archivo .txt ────────────────────────────────────────────────
+  if (st.state === "wait_file") {
+    if (!m.document) {
+      await bot.sendMessage(chatId,
+        "📎 Por favor, envíame el archivo *.txt* con los números.\n_Un número por línea._\n\nEscribe /start para reiniciar.",
+        { parse_mode: "Markdown" }
       );
       return;
     }
 
-    if (state.step === "message") {
-      const message = (m.text || "").trim();
-      if (!message) { await live(chat, "❌ *El mensaje no puede estar vacío*"); return; }
-      waitMsg.delete(chat);
-
-      if (state.listFile) {
-        // Envío a lista
-        const phones = loadPhones(state.listFile);
-        if (!phones.length) { await live(chat, "❌ *La lista no tiene números válidos*", kb.main()); return; }
-
-        queue.items   = phones.map(p => ({ phone: p, message }));
-        queue.total   = phones.length;
-        queue.chat    = chat;
-        queue.currentMsg = message;
-
-        runQueue().catch(e => {
-          queue.on = false;
-          live(chat, `💥 *Error crítico:* \`${e.message.slice(0, 200)}\``, kb.done());
-        });
-
-      } else if (state.phone) {
-        // Envío a número único
-        queue.items   = [{ phone: state.phone, message }];
-        queue.total   = 1;
-        queue.chat    = chat;
-        queue.currentMsg = message;
-
-        runQueue().catch(e => {
-          queue.on = false;
-          live(chat, `💥 *Error crítico:* \`${e.message.slice(0, 200)}\``, kb.done());
-        });
-      }
-      return;
-    }
-  }
-
-  // Archivo .txt con lista de números
-  if (m.document) {
     const doc = m.document;
-    if (!doc.file_name?.endsWith(".txt")) {
-      await live(chat, "⚠️ *Solo se aceptan archivos .txt*\nUno por línea con los números de teléfono.");
+    if (!doc.file_name?.toLowerCase().endsWith(".txt")) {
+      await bot.sendMessage(chatId,
+        "❌ *Solo se aceptan archivos .txt*\nEnvíame el archivo correcto.",
+        { parse_mode: "Markdown" }
+      );
       return;
     }
 
     try {
-      const fileInfo = await bot.getFile(doc.file_id);
-      const fileUrl  = `https://api.telegram.org/file/bot${TOKEN}/${fileInfo.file_path}`;
-      const res      = await fetch(fileUrl);
-      const content  = await res.text();
+      const content = await downloadFile(doc.file_id);
+      const phones  = parsePhones(content);
 
-      const safeName = (doc.file_name || "lista").replace(/[^a-zA-Z0-9_\-]/g, "_").replace(/\.txt$/, "");
-      const dest     = path.join(LISTS_DIR, `${safeName}.txt`);
-      fs.writeFileSync(dest, content, "utf-8");
+      if (!phones.length) {
+        await bot.sendMessage(chatId,
+          "❌ *No se encontraron números válidos en el archivo.*\n" +
+          "Asegúrate de que hay un número por línea y vuelve a enviarlo.",
+          { parse_mode: "Markdown" }
+        );
+        return;
+      }
 
-      const phones = loadPhones(dest);
-      await live(chat,
-        `✅ *Lista guardada:* ${safeName}\n` +
-        `📊 ${phones.toLocaleString ? phones.length.toLocaleString() : phones.length} números encontrados\n\n` +
-        `Ahora ve a 📋 *Enviar a una lista* para usarla.`,
-        kb.main()
+      st.phones = phones;
+      st.state  = "wait_message";
+      chatState.set(chatId, st);
+
+      await bot.sendMessage(chatId,
+        `✅ *Archivo recibido*\n📊 *${phones.length.toLocaleString()} números* encontrados\n\n` +
+        `✉️ *Paso 2/2:* Escribe el mensaje que quieres enviar a todos:`,
+        { parse_mode: "Markdown" }
       );
     } catch (e) {
-      await live(chat, `❌ *Error al procesar archivo:* \`${e.message}\``, kb.main());
+      await bot.sendMessage(chatId,
+        `❌ *Error al leer el archivo:* \`${e.message}\`\n\nUsa /start para reintentar.`,
+        { parse_mode: "Markdown" }
+      );
     }
     return;
   }
+
+  // ── Esperando mensaje de texto ────────────────────────────────────────────
+  if (st.state === "wait_message") {
+    if (!m.text || !m.text.trim()) {
+      await bot.sendMessage(chatId,
+        "❌ *El mensaje no puede estar vacío.* Escribe el texto que quieres enviar:",
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    st.message = m.text.trim();
+    st.state   = "sending";
+    chatState.set(chatId, st);
+
+    await bot.sendMessage(chatId,
+      `✅ *Mensaje guardado*\n\n` +
+      `📱 Números: *${st.phones.length.toLocaleString()}*\n` +
+      `✉️ Mensaje: _${st.message.slice(0, 60)}${st.message.length > 60 ? "..." : ""}_\n\n` +
+      `🚀 Iniciando envío...`,
+      { parse_mode: "Markdown" }
+    );
+
+    await startSending(chatId);
+    return;
+  }
+
+  // ── Estado idle / otros ───────────────────────────────────────────────────
+  if (st.state === "sending" || queue.running) {
+    await bot.sendMessage(chatId,
+      "📤 *Envío en curso.* Usa el botón ⛔ Detener para pararlo.",
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+
+  // Por defecto → redirigir a /start
+  await bot.sendMessage(chatId,
+    "👋 Escribe /start para comenzar.",
+    { parse_mode: "Markdown" }
+  );
 });
 
-// ── COMANDOS BASE ─────────────────────────────────────────────────────────────
-bot.onText(/\/start/, async m => {
-  if (!isAllowed(m)) { await live(m.chat.id, "🚫 *Acceso denegado*"); return; }
-  liveMsgId = null; liveMsgChat = null;
-  await live(m.chat.id,
-    `🤖 *Google Messages Sender v1.0*\n\n` +
-    `Envía SMS desde tu Android a través de Google Messages.\n\n` +
-    `📱 ${connected ? "🟢 Android vinculado" : "🔴 Sin dispositivo vinculado"}\n\n` +
-    `_Conecta tu Android y empieza a enviar._`,
-    kb.main()
-  );
+// ── CALLBACKS ─────────────────────────────────────────────────────────────────
+bot.on("callback_query", async q => {
+  const chatId = q.message.chat.id;
+  const data   = q.data;
+  bot.answerCallbackQuery(q.id).catch(() => {});
+
+  if (!isAllowed(q)) {
+    await bot.sendMessage(chatId, "🚫 *Acceso denegado*", { parse_mode: "Markdown" });
+    return;
+  }
+
+  if (data === "stop_send") {
+    if (queue.running) {
+      queue.stop = true;
+      // Editar el botón para mostrar "Deteniendo..."
+      await bot.editMessageReplyMarkup(
+        { inline_keyboard: [[{ text: "⏳ Deteniendo...", callback_data: "noop" }]] },
+        { chat_id: chatId, message_id: q.message.message_id }
+      ).catch(() => {});
+    }
+    return;
+  }
+
+  if (data === "new_send") {
+    const st = chatState.get(chatId) || {};
+    st.state   = "wait_file";
+    st.phones  = null;
+    st.message = null;
+    chatState.set(chatId, st);
+    await bot.sendMessage(chatId,
+      "📎 *Nuevo envío*\n\nEnvíame el archivo *.txt* con los números de teléfono:",
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
 });
 
 // ── SHUTDOWN ──────────────────────────────────────────────────────────────────
 async function shutdown(sig) {
   console.log(`[${sig}] Cerrando...`);
-  if (queue.on) queue.stop = true;
+  if (queue.running) queue.stop = true;
   if (browser) { try { await browser.close(); } catch (_) {} }
   try { bot.stopPolling(); } catch (_) {}
   process.exit(0);
@@ -695,7 +615,7 @@ process.on("uncaughtException",  e => console.error("[FATAL]", e.message));
 process.on("unhandledRejection", r => console.error("[FATAL]", r));
 
 // ── MAIN ──────────────────────────────────────────────────────────────────────
-console.log("═══ Google Messages Sender Bot v1.0 ═══");
-console.log(`✅ Bot listo. Usuario permitido: @${ALLOWED_USERNAME}`);
-console.log("Esperando 6s antes de conectar (evita conflicto de instancias)...");
-startBot().then(() => console.log("Esperando /start en Telegram..."));
+if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
+console.log("═══ Google Messages Sender Bot v2.0 ═══");
+console.log("Esperando 6s para evitar conflicto de instancias...");
+startBot();
