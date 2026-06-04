@@ -23,7 +23,25 @@ const NAV_TIMEOUT = 30000;  // timeout de navegación (ms)
 const QR_TIMEOUT  = 120000; // tiempo máximo para escanear QR (ms)
 
 // ── ESTADO GLOBAL ────────────────────────────────────────────────────────────
-const bot       = new TelegramBot(TOKEN, { polling: true });
+const bot       = new TelegramBot(TOKEN, {
+  polling: {
+    interval: 300,
+    autoStart: true,
+    params: { timeout: 10, allowed_updates: [] }
+  }
+});
+
+// Manejo del error 409 (instancia duplicada): esperar y reiniciar polling
+bot.on("polling_error", async err => {
+  if (err.code === "ETELEGRAM" && err.message.includes("409")) {
+    console.warn("⚠️  409 Conflict: otra instancia activa. Reintentando en 15s...");
+    await bot.stopPolling();
+    await new Promise(r => setTimeout(r, 15000));
+    await bot.startPolling({ restart: true, dropPendingUpdates: true });
+  } else {
+    console.error("polling_error:", err.message);
+  }
+});
 let browser     = null;
 let page        = null;
 let connected   = false;
