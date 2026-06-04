@@ -1,0 +1,16 @@
+{
+  "name": "google-messages-sender-bot",
+  "version": "1.0.0",
+  "description": "Bot de Telegram para enviar SMS a través de Google Messages Web",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "puppeteer": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
