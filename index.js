@@ -23,25 +23,29 @@ const NAV_TIMEOUT = 30000;  // timeout de navegación (ms)
 const QR_TIMEOUT  = 120000; // tiempo máximo para escanear QR (ms)
 
 // ── ESTADO GLOBAL ────────────────────────────────────────────────────────────
-const bot       = new TelegramBot(TOKEN, {
-  polling: {
-    interval: 300,
-    autoStart: true,
-    params: { timeout: 10, allowed_updates: [] }
-  }
-});
+// Arrancamos SIN polling automático para controlarlo manualmente
+const bot = new TelegramBot(TOKEN, { polling: false });
 
-// Manejo del error 409 (instancia duplicada): esperar y reiniciar polling
+// En 409 salimos limpiamente — Railway reiniciará el contenedor
+// y para entonces el despliegue anterior ya habrá muerto
 bot.on("polling_error", async err => {
-  if (err.code === "ETELEGRAM" && err.message.includes("409")) {
-    console.warn("⚠️  409 Conflict: otra instancia activa. Reintentando en 15s...");
-    await bot.stopPolling();
-    await new Promise(r => setTimeout(r, 15000));
-    await bot.startPolling({ restart: true, dropPendingUpdates: true });
+  if (err.message && err.message.includes("409")) {
+    console.warn("⚠️  409 Conflict: saliendo para que Railway reinicie limpio...");
+    await bot.stopPolling().catch(() => {});
+    process.exit(0);
   } else {
     console.error("polling_error:", err.message);
   }
 });
+
+// Función de arranque con delay para sobrevivir rolling deploys
+async function startBot() {
+  // Eliminar webhook + descartar mensajes acumulados (limpia sesión anterior)
+  try { await bot.deleteWebhook({ drop_pending_updates: true }); } catch (_) {}
+  // Dar 6 segundos para que Railway mate el contenedor viejo
+  await new Promise(r => setTimeout(r, 6000));
+  await bot.startPolling({ polling: true });
+}
 let browser     = null;
 let page        = null;
 let connected   = false;
@@ -686,5 +690,6 @@ process.on("unhandledRejection", r => console.error("[FATAL]", r));
 
 // ── MAIN ──────────────────────────────────────────────────────────────────────
 console.log("═══ Google Messages Sender Bot v1.0 ═══");
-console.log(`✅ Bot iniciado. Usuario permitido: @${ALLOWED_USERNAME}`);
-console.log("Esperando /start en Telegram...");
+console.log(`✅ Bot listo. Usuario permitido: @${ALLOWED_USERNAME}`);
+console.log("Esperando 6s antes de conectar (evita conflicto de instancias)...");
+startBot().then(() => console.log("Esperando /start en Telegram..."));
